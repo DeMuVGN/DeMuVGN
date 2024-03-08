@@ -263,7 +263,7 @@ def get_row_count(file_path):
 
 
 if __name__ == '__main__':
-    forward = "../datasets/"
+    forward = "../../datasets/"
     files_and_names = [
         (forward + "activemq/activemq-5.0.0/", "activemq-5.0.0(1)"),
         (forward + "activemq/activemq-5.1.0/", "activemq-5.1.0(1)"),
