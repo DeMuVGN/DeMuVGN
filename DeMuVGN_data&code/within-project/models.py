@@ -553,30 +553,65 @@ class GAT_Classifier(nn.Module):
         return x
 
 
-# 连接前用nhid=66
 class Classifier(nn.Module):
+    def __init__(self, nembed, hidden_layers, nclass, dropout):
+        super(Classifier, self).__init__()
+
+        self.layers = nn.ModuleList()
+        self.dropout = nn.Dropout(dropout)
+
+        # 输入层
+        self.layers.append(nn.Linear(nembed, hidden_layers[0]))
+
+        # 隐藏层
+        for i in range(1, len(hidden_layers)):
+            self.layers.append(nn.Linear(hidden_layers[i - 1], hidden_layers[i]))
+
+        # 输出层
+        self.layers.append(nn.Linear(hidden_layers[-1], nclass))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for layer in self.layers:
+            nn.init.normal_(layer.weight, std=0.1)
+
+    def forward(self, x, adj):
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:  # 最后一层前不使用激活函数和dropout
+                x = F.relu(x)
+                x = self.dropout(x)
+        return x
+
+
+# 连接前用nhid=66
+class Classifier_old(nn.Module):
     def __init__(self, nembed, nhid, nclass, dropout):
         super(Classifier, self).__init__()
 
         self.mlp1 = nn.Linear(nhid, 32)
         self.mlp2 = nn.Linear(32, 16)
         self.mlp3 = nn.Linear(16, nclass)
-        self.dropout = dropout
+        self.dropout = nn.Dropout(dropout)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        nn.init.normal_(self.mlp1.weight, std=0.05)
-        nn.init.normal_(self.mlp2.weight, std=0.05)
-        nn.init.normal_(self.mlp3.weight, std=0.05)
+        nn.init.normal_(self.mlp1.weight, std=0.1)
+        nn.init.normal_(self.mlp2.weight, std=0.1)
+        nn.init.normal_(self.mlp3.weight, std=0.1)
 
     def forward(self, x, adj):
-        x = (self.mlp1(x))
-        x = self.mlp2(x)
+        x = F.relu(self.mlp1(x))
+        x = self.dropout(x)
+        x = F.relu(self.mlp2(x))
+        x = self.dropout(x)
         x = self.mlp3(x)
 
         return x
-import torch.nn.functional as F
+
+
 
 class Classifier2(nn.Module):
     def __init__(self, nembed, nhid, nclass, dropout):
@@ -652,38 +687,46 @@ class Decoder(Module):
 
 
 class BiGGNN(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, device):
         super(BiGGNN, self).__init__()
+        self.device = device
         hidden_size = config.hidden_size
         self.hidden_size = hidden_size
         self.graph_direction = config.graph_direction  # 边的方向
+        # self.graph_hops = config.hops
         self.graph_hops = config.hops
         self.word_dropout = config.dropout  # 丢弃词向量，一般在0~1之间
-        self.linear_max = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.linear_max = nn.Linear(hidden_size, hidden_size, bias=False).to(device)
         #####################################################
-        self.static_graph_mp = GraphMessagePassing(config)
-        self.static_gru_step = GRUStep(hidden_size, hidden_size)
+        self.static_graph_mp = GraphMessagePassing(config).to(device)
+        self.static_gru_step = GRUStep(hidden_size, hidden_size).to(device)
         if self.graph_direction == 'all':
-            self.static_gated_fusion = GatedFusion(hidden_size)
+            self.static_gated_fusion = GatedFusion(hidden_size).to(device)
         self.graph_update = self.static_graph_update
-        self.classifier = nn.Linear(hidden_size, 2)
+        self.classifier = nn.Linear(hidden_size, 2).to(device)
 
-    def forward(self, node_feature, edge_vec, adj_in, adj_out, config):
+        self.linear_fea = nn.Linear(in_features=66, out_features=hidden_size)
+
+    def forward(self, node_feature, edge_vec, adj_in, adj_out, config, device):
+        node_feature = self.linear_fea(node_feature)
         node_feature = node_feature.repeat(config.batch_size, 1, 1)
         adj_in = adj_in.repeat(config.batch_size, 1, 1)
         adj_out = adj_out.repeat(config.batch_size, 1, 1)
-        node_state = self.graph_update(node_feature, edge_vec, adj_in, adj_out)
+        node_feature = node_feature.to(device)
+        adj_in = adj_in.to(device)
+        adj_out = adj_out.to(device)
+        node_state = self.graph_update(node_feature, edge_vec, adj_in, adj_out, device)
         return node_state
 
-    def static_graph_update(self, node_feature, edge_vec, node2edge, edge2node):
+    def static_graph_update(self, node_feature, edge_vec, node2edge, edge2node, device):
         ''' Static graph update '''
-        for _ in range(self.graph_hops):  # 重复所有跳
+        for _ in range(self.graph_hops):  # 重复所有跳f
             # 后方向的a
             bw_agg_state = self.static_graph_mp.mp_func(node_feature, edge_vec, node2edge,
                                                         edge2node)  # (num_nodes, dim)
             fw_agg_state = self.static_graph_mp.mp_func(node_feature, edge_vec, edge2node.transpose(1, 2),
                                                         node2edge.transpose(1, 2))
-            agg_state = self.static_gated_fusion(fw_agg_state, bw_agg_state)
+            agg_state = self.static_gated_fusion(fw_agg_state, bw_agg_state, device)
             node_feature = self.static_gru_step(node_feature, agg_state)
         return node_feature  # 节点特征矩阵
 
@@ -756,7 +799,7 @@ class GatedFusion(nn.Module):  # Fuse(a, b)
         '''GatedFusion module'''
         self.fc_z = nn.Linear(4 * hidden_size, hidden_size, bias=True)  # 4列矩阵线性变换为1列向量
 
-    def forward(self, h_state, input):
+    def forward(self, h_state, input, device):
         # 门控向量
         z = torch.sigmoid(self.fc_z(
             torch.cat([h_state, input, h_state * input, h_state - input], -1)))  # 这里cat将四列向量组成一个矩阵，-1表示按倒数第一维cat

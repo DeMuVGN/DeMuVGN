@@ -2,19 +2,66 @@ import argparse
 import csv
 import os
 
+from sklearn.preprocessing import normalize
 import scipy.sparse as sp
 import numpy as np
 import torch
 import ipdb
-from scipy.io import loadmat
-import networkx as nx
-import multiprocessing as mp
 import torch.nn.functional as F
-from functools import partial
 import random
 from sklearn.metrics import roc_auc_score, f1_score
 from copy import deepcopy
 from scipy.spatial.distance import pdist, squareform
+
+
+
+def get_parser():
+    parser = argparse.ArgumentParser()
+    # parser.add_argument('--batch_size', type=int, default=4, help='batch_size')
+    parser.add_argument('--hidden_size', type=int, default=66, help='隐藏层的大小，小型网络一般在64， 128， 256')
+    parser.add_argument('--graph_direction', type=str, default='all', help='边的方向')
+    parser.add_argument('--message_function', type=str, default='no_edge',
+                        help='message_function传递函数')  # 分为edge_mm、edge_network、edge_pair、no_edge
+    parser.add_argument('--graph_hops', type=int, default=2, help='图神经网络的跳数')
+    parser.add_argument('--word_dropout', type=float, default=0.5, help='丢弃词向量，一般在0~1之间')
+    parser.add_argument('--portion', type=float, default=0.5, help='采样比例')
+
+    parser.add_argument('--no-cuda', action='store_true', default=False,
+                        help='Disables CUDA training.')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--nhid', type=int, default=64)
+    parser.add_argument('--dataset', type=str, default='cora')
+    parser.add_argument('--size', type=int, default=100)
+    parser.add_argument('--hops', type=int, default=2)
+
+    parser.add_argument('--epochs', type=int, default=200,
+                        help='Number of epochs to train.')
+    parser.add_argument('--lr', type=float, default=0.001)
+    parser.add_argument('--weight_decay', type=float, default=5e-4)
+    parser.add_argument('--dropout', type=float, default=0.1)
+
+    parser.add_argument('--batch_nums', type=int, default=3000, help='number of batches per epoch')
+
+    parser.add_argument('--imbalance', action='store_true', default=True)
+    parser.add_argument('--needSmote', type=str, default='on',
+                        choices=['on', 'off'])
+    parser.add_argument('--setting', type=str, default='smote',
+                        choices=['no', 'upsampling', 'smote', 'reweight', 'embed_up', 'recon', 'newG_cls',
+                                 'recon_newG'])
+    # upsampling: oversample in the raw input; smote: ; reweight: reweight minority classes;
+    # embed_up:
+    # recon: pretrain; newG_cls: pretrained decoder; recon_newG: also finetune the decoder
+
+    parser.add_argument('--opt_new_G', action='store_true',
+                        default=False)  # whether optimize the decoded graph based on classification result.
+    parser.add_argument('--load', type=str, default=None)
+    parser.add_argument('--up_scale', type=float, default=2)
+    parser.add_argument('--im_ratio', type=float, default=0.5)
+    parser.add_argument('--rec_weight', type=float, default=0.000001)
+    parser.add_argument('--model', type=str, default='BiGGNN',
+                        choices=['sage', 'gcn', 'GAT', 'BiGGNN'])
+
+    return parser
 
 def weight_norm(arr):
     # 获取第三列
@@ -49,7 +96,7 @@ def load_data(file, name, choose):
     idx_features_labels = np.array(idx_features_labels)
     weight_file = open('{}{}.txt'.format(file, choose), 'r')
     weight_data = np.genfromtxt(weight_file, delimiter=',', dtype=np.float)
-    weight_data = weight_norm(weight_data)
+    # weight_data = weight_norm(weight_data)
 
     features = sp.csr_matrix(idx_features_labels[:, 2:-1], dtype=np.float32)
     labels = encode_onehot(idx_features_labels[:, -1].astype(float).astype(int))  # onehot编码
@@ -69,14 +116,6 @@ def load_data(file, name, choose):
         matrix_in[x - 1][y - 1] += weight
         matrix_out[y - 1][x - 1] += weight
     adj = sp.coo_matrix(matrix)
-
-
-    # build symmetric adjacency matrix，计算转置矩阵（有向图->无向图）
-    # adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-
-
-    #features = normalize(features)  # 特征归一化，不是必要的
-    # adj = normalize(adj + sp.eye(adj.shape[0]))  # 对A+I归一化
 
     idx = list(range(n))
     random.shuffle(idx)
@@ -105,7 +144,69 @@ def load_data(file, name, choose):
 
     return adj, features, labels, idx_train, idx_val, idx_test, matrix_in, matrix_out
 
-def load_cp_data(file, name, choose):
+import numpy as np
+
+def log_scale_normalization(weight_data):
+    # 对权重应用对数变换，这里使用自然对数
+    # 为避免对数为负，对所有权重加1（假设所有权重都是非负的）
+    log_weights = np.log1p(weight_data[:, 2])
+                    
+    # 应用最小-最大归一化
+    min_weight = np.min(log_weights)
+    max_weight = np.max(log_weights)
+    normalized_weights = (log_weights - min_weight) / (max_weight - min_weight)
+                                        
+                                            # 更新原权重数据
+    weight_data[:, 2] = normalized_weights
+                                                    
+    return weight_data
+
+# 标准化
+def standardize_weights(weight_data):
+    weights = weight_data[:, 2]  # 提取权重
+    mean_weight = np.mean(weights)
+    std_weight = np.std(weights)
+    standardized_weights = (weights - mean_weight) / std_weight
+    weight_data[:, 2] = standardized_weights
+    return weight_data
+
+from sklearn.preprocessing import QuantileTransformer
+
+
+# 分位数归一化
+def quantile_normalization(weight_data):
+    weights = weight_data[:, 2].reshape(-1, 1)  # 提取权重并转换为2D以适应scikit-learn API
+    transformer = QuantileTransformer(output_distribution='uniform')
+    normalized_weights = transformer.fit_transform(weights).flatten()
+    weight_data[:, 2] = normalized_weights
+    return weight_data
+# 稳健缩放
+def robust_scaling(weight_data):
+    weights = weight_data[:, 2]  # 提取权重
+    median_weight = np.median(weights)
+    Q1 = np.percentile(weights, 25)
+    Q3 = np.percentile(weights, 75)
+    IQR = Q3 - Q1
+    scaled_weights = (weights - median_weight) / IQR
+    weight_data[:, 2] = scaled_weights
+    return weight_data
+
+
+#幂律缩放
+def power_law_scaling(weight_data):
+    weights = weight_data[:, 2]  # 提取权重
+    # 应用平方根变换，适用于正数权重
+    scaled_weights = np.sqrt(weights)
+    # 归一化到[0, 1]区间
+    min_weight = np.min(scaled_weights)
+    max_weight = np.max(scaled_weights)
+    normalized_weights = (scaled_weights - min_weight) / (max_weight - min_weight)
+    weight_data[:, 2] = normalized_weights
+    return weight_data
+
+
+
+def load_cp_data(file, name, choose, mood='test', portion=0.5):
     # csv转为txt
     """Load citation network dataset (cora only for now)"""
     # print('Loading dataset...')
@@ -123,10 +224,14 @@ def load_cp_data(file, name, choose):
     idx_features_labels = np.array(idx_features_labels)
     weight_file = open('{}{}.txt'.format(file, choose), 'r')
     weight_data = np.genfromtxt(weight_file, delimiter=',', dtype=np.int32)
+    #weight_data = log_scale_normalization(weight_data)
+    weight_data = weight_norm(weight_data)
 
     features = sp.csr_matrix(idx_features_labels[:, 2:-1], dtype=np.float32)
+    #features = normalize(features)
+    features = normalize(features, norm='l2', axis=0)
     labels = encode_onehot(idx_features_labels[:, -1].astype(float).astype(int))  # onehot编码
-
+    
     n = idx_features_labels.shape[0]  # 结点个数
 
     # build graph，构建邻接矩阵
@@ -143,8 +248,8 @@ def load_cp_data(file, name, choose):
         matrix_out[y - 1][x - 1] += weight
     adj = sp.coo_matrix(matrix)
 
-    adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
-    adj = normalize(adj + sp.eye(adj.shape[0]))  # 对A+I归一化
+    # adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+    # adj = normalize(adj + sp.eye(adj.shape[0]))  # 对A+I归一化
 
     features = torch.FloatTensor(np.array(features.todense()))
     labels = torch.LongTensor(np.where(labels)[1])
@@ -152,22 +257,29 @@ def load_cp_data(file, name, choose):
 
     matrix_in = torch.FloatTensor(matrix_in)
     matrix_out = torch.FloatTensor(matrix_out)
-    im_class_num = 2
-    idx_train = []
-    # if args.setting == 'upsampling':
-    #     adj, adj_in, adj_out, features, labels, idx_train1 = smote_utils.src_upsample(adj, matrix_in, matrix_out,
-    #                                                                                   features,
-    #                                                                                   labels, idx_train,
-    #                                                                                   portion=args.up_scale,
-    #                                                                                   im_class_num=im_class_num)
-    # if args.setting == 'smote':
-    #     adj, adj_in, adj_out, features, labels, idx_train1 = smote_utils.src_smote(adj, matrix_in, matrix_out,
-    #                                                                                features, labels,
-    #                                                                                idx_train,
-    #                                                                                portion=args.up_scale,
-    #                                                                                im_class_num=im_class_num)
+    im_class_num = 1
+    idx_train = torch.tensor(range(labels.shape[0]))
+    if mood == 'train':
+        adj, matrix_in, matrix_out, features, labels, idx_train = src_smote(adj, matrix_in, matrix_out,
+                                                                                        features, labels,
+                                                                                        idx_train,
+                                                                                        portion=portion,
+                                                                                        im_class_num=im_class_num)
+        # 随机打乱idx_train
+        idx_train = idx_train[torch.randperm(idx_train.size(0))]
 
-    return adj, features, labels, matrix_in, matrix_out
+        # 计算分割点
+        split_idx = int(0.8 * len(idx_train))
+
+        # 分割成80%的训练数据和20%的验证数据
+        train_idx, val_idx = idx_train[:split_idx], idx_train[split_idx:]
+
+        train_data = adj, features, labels, matrix_in, matrix_out
+
+        return train_data, train_idx, val_idx
+    else:
+        return adj, features, labels, matrix_in, matrix_out
+
 
 def encode_onehot(labels):
     classes = set(labels)
@@ -176,22 +288,26 @@ def encode_onehot(labels):
     labels_onehot = np.array(list(map(classes_dict.get, labels)), dtype=np.int32)
     return labels_onehot
 
+
 # 列归一化
 def get_row_min_max(df, row):
     x_max = int(df.loc[row:row, "v_num":"RealBugCount"].max(axis=1))
     x_min = int(df.loc[row:row, "v_num":"RealBugCount"].min(axis=1))
     return x_min, x_max
 
+
 def colNorm(filename):
     df = pd.read_csv(filename)
     for i in range(len(df)):
-        if i%10==0:
-            print(round(i*100/len(df),2),"%")
+        if i % 10 == 0:
+            print(round(i * 100 / len(df), 2), "%")
         x_min, x_max = get_row_min_max(df, i)
-        df.loc[i:i, "CountDeclMethodPrivate":"RealBugCount"] = df.loc[i:i, "CountDeclMethodPrivate":"RealBugCount"].sub(x_min)/(x_max-x_min)
+        df.loc[i:i, "CountDeclMethodPrivate":"RealBugCount"] = df.loc[i:i, "CountDeclMethodPrivate":"RealBugCount"].sub(
+            x_min) / (x_max - x_min)
     df.to_csv(filename, index=False)
 
-def normalize(mx):
+
+def normalize2(mx):
     """Row-normalize sparse matrix"""
     rowsum = np.array(mx.sum(1))
     r_inv = np.power(rowsum, -1).flatten()
@@ -217,6 +333,7 @@ def sparse_mx_to_torch_sparse_tensor(sparse_mx):
     values = torch.from_numpy(sparse_mx.data)
     shape = torch.Size(sparse_mx.shape)
     return torch.sparse.FloatTensor(indices, values, shape)
+
 
 # smote过采样
 def oversample(features, edges):
@@ -258,52 +375,8 @@ def oversample(features, edges):
         edges = np.concatenate((edges, [new_edge]))
 
     return oversampled_features, edges
-def get_parser():
-    parser = argparse.ArgumentParser()
-    # parser.add_argument('--batch_size', type=int, default=4, help='batch_size')
-    parser.add_argument('--hidden_size', type=int, default=66, help='隐藏层的大小，小型网络一般在64， 128， 256')
-    parser.add_argument('--graph_direction', type=str, default='all', help='边的方向')
-    parser.add_argument('--message_function', type=str, default='no_edge',
-                         help='message_function传递函数')  # 分为edge_mm、edge_network、edge_pair、no_edge
-    parser.add_argument('--graph_hops', type=int, default=2, help='图神经网络的跳数')
-    parser.add_argument('--word_dropout', type=float, default=0.5, help='丢弃词向量，一般在0~1之间')
 
-    parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='Disables CUDA training.')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--nhid', type=int, default=64)
-    parser.add_argument('--dataset', type=str, default='cora')
-    parser.add_argument('--size', type=int, default=100)
-    parser.add_argument('--hops', type=int, default=2)
 
-    parser.add_argument('--epochs', type=int, default=200,
-                        help='Number of epochs to train.')
-    parser.add_argument('--lr', type=float, default=0.001)
-    parser.add_argument('--weight_decay', type=float, default=5e-4)
-    parser.add_argument('--dropout', type=float, default=0.1)
-
-    parser.add_argument('--batch_nums', type=int, default=3000, help='number of batches per epoch')
-
-    parser.add_argument('--imbalance', action='store_true', default=True)
-    parser.add_argument('--needSmote', type=str, default='on',
-                        choices=['on', 'off'])
-    parser.add_argument('--setting', type=str, default='smote',
-                        choices=['no', 'upsampling', 'smote', 'reweight', 'embed_up', 'recon', 'newG_cls',
-                                 'recon_newG'])
-    # upsampling: oversample in the raw input; smote: ; reweight: reweight minority classes;
-    # embed_up: 
-    # recon: pretrain; newG_cls: pretrained decoder; recon_newG: also finetune the decoder
-
-    parser.add_argument('--opt_new_G', action='store_true',
-                        default=False)  # whether optimize the decoded graph based on classification result.
-    parser.add_argument('--load', type=str, default=None)
-    parser.add_argument('--up_scale', type=float, default=2)
-    parser.add_argument('--im_ratio', type=float, default=0.5)
-    parser.add_argument('--rec_weight', type=float, default=0.000001)
-    parser.add_argument('--model', type=str, default='BiGGNN',
-                        choices=['sage', 'gcn', 'GAT', 'BiGGNN'])
-
-    return parser
 
 
 def split_arti(labels, c_train_num):
@@ -416,13 +489,13 @@ def print_class_acc(output, labels, class_num_list, pre='valid'):
     # print class-wise performance
     '''
     for i in range(labels.max()+1):
-        
+
         cur_tpr = accuracy(output[pre_num:pre_num+class_num_list[i]], labels[pre_num:pre_num+class_num_list[i]])
         print(str(pre)+" class {:d} True Positive Rate: {:.3f}".format(i,cur_tpr.item()))
 
         index_negative = labels != i
         labels_negative = labels.new(labels.shape).fill_(i)
-        
+
         cur_fpr = accuracy(output[index_negative,:], labels_negative[index_negative])
         print(str(pre)+" class {:d} False Positive Rate: {:.3f}".format(i,cur_fpr.item()))
 
@@ -451,7 +524,6 @@ def arrray_to_sparse(adj):
         torch.Size(adj.shape)
     )
     return adj
-
 
 
 def src_upsample(adj, adj_in, adj_out, features, labels, idx_train, portion=1.0, im_class_num=1):
@@ -532,8 +604,97 @@ def src_upsample(adj, adj_in, adj_out, features, labels, idx_train, portion=1.0,
 
     return adj, adj_in, adj_out, features, labels, idx_train
 
-
 def src_smote(adj, adj_in, adj_out, features, labels, idx_train, portion=1.0, im_class_num=1):
+    c_largest = labels.max().item()  # 标签最大值
+
+    adj_back = adj.to_dense()
+    chosen_indices = []
+    new_features_list = []
+
+    adj_back_in = adj_in
+    adj_back_out = adj_out
+
+    avg_number = int(idx_train.shape[0] / (c_largest + 1))
+    target_num = 0
+    if portion == 'auto':
+        num_minority = (labels == c_largest).sum().item()
+        num_majority = (labels == (c_largest - im_class_num)).sum().item()
+        target_num = num_majority - num_minority
+        portion = target_num / num_minority
+
+    # print('portion:', portion)
+
+    for i in range(im_class_num):
+        new_chosen = idx_train[(labels == (c_largest - i))[idx_train]]
+        if portion == 0 or portion == 'auto':
+            if portion == 'auto':
+                c_portion = target_num // new_chosen.shape[0]
+                portion_rest = target_num % new_chosen.shape[0] / new_chosen.shape[0]
+            else:
+                c_portion = int(avg_number / new_chosen.shape[0])
+                portion_rest = (avg_number / new_chosen.shape[0]) - c_portion
+        else:
+            c_portion = int(portion)
+            portion_rest = portion - c_portion
+
+        for j in range(c_portion + (1 if portion_rest > 0 else 0)):
+            num = int(new_chosen.shape[0] * (portion_rest if j == c_portion else 1))
+            chosen = new_chosen[:num]
+
+            chosen_embed = features[chosen, :]
+            distance = squareform(pdist(chosen_embed.cpu().detach()))
+            np.fill_diagonal(distance, np.inf)
+
+            idx_neighbor = distance.argmin(axis=-1)
+            interp_place = random.random()
+            embed = chosen_embed + (chosen_embed[idx_neighbor, :] - chosen_embed) * interp_place
+
+            chosen_indices.append(chosen)
+            new_features_list.append(embed)
+
+    chosen = torch.cat(chosen_indices, dim=0) if chosen_indices else None
+    new_features = torch.cat(new_features_list, dim=0) if new_features_list else None
+
+    add_num = chosen.shape[0] if chosen is not None else 0
+    new_adj = torch.zeros((adj_back.shape[0] + add_num, adj_back.shape[0] + add_num), device=adj_back.device)
+    new_adj[:adj_back.shape[0], :adj_back.shape[0]] = adj_back
+    new_adj_in = torch.zeros((adj_back_in.shape[0] + add_num, adj_back_in.shape[0] + add_num),
+                             device=adj_back_in.device)
+    new_adj_out = torch.zeros((adj_back_out.shape[0] + add_num, adj_back_out.shape[0] + add_num),
+                              device=adj_back_out.device)
+
+    new_adj_in[:adj_back_in.shape[0], :adj_back_in.shape[0]] = adj_back_in
+    new_adj_out[:adj_back_out.shape[0], :adj_back_out.shape[0]] = adj_back_out
+
+    if chosen is not None:
+        new_adj_in[adj_back_in.shape[0]:, :adj_back_in.shape[0]] = adj_back_in[chosen, :]
+        new_adj_in[:adj_back_in.shape[0], adj_back_in.shape[0]:] = adj_back_in[:, chosen]
+        new_adj_in[adj_back_in.shape[0]:, adj_back_in.shape[0]:] = adj_back_in[chosen, :][:, chosen]
+
+        new_adj_out[adj_back_out.shape[0]:, :adj_back_out.shape[0]] = adj_back_out[chosen, :]
+        new_adj_out[:adj_back_out.shape[0], adj_back_out.shape[0]:] = adj_back_out[:, chosen]
+        new_adj_out[adj_back_out.shape[0]:, adj_back_out.shape[0]:] = adj_back_out[chosen, :][:, chosen]
+
+    # Repeat for adj_in and adj_out (omitted for brevity)
+
+    features_append = new_features.clone() if new_features is not None else None
+    labels_append = labels[chosen].clone() if chosen is not None else None
+    idx_new = torch.arange(adj_back.shape[0], adj_back.shape[0] + add_num, device=idx_train.device)
+    idx_train_append = idx_train.new(idx_new)
+
+    features = torch.cat((features, features_append), 0) if features_append is not None else features
+    labels = torch.cat((labels, labels_append), 0) if labels_append is not None else labels
+    idx_train = torch.cat((idx_train, idx_train_append), 0) if idx_train_append is not None else idx_train
+
+    adj = new_adj.to_sparse()
+    adj_in = new_adj_in.to_sparse()
+    adj_out = new_adj_out.to_sparse()
+
+    return adj, adj_in, adj_out, features, labels, idx_train
+
+
+
+def src_smote2(adj, adj_in, adj_out, features, labels, idx_train, portion=1.0, im_class_num=1):
     c_largest = labels.max().item()  # 标签最大值
 
     # 将邻接矩阵转换为稠密表示
@@ -546,17 +707,27 @@ def src_smote(adj, adj_in, adj_out, features, labels, idx_train, portion=1.0, im
 
     # 计算平均样本数量
     avg_number = int(idx_train.shape[0] / (c_largest + 1))
+    target_num = 0
+    if portion == 'auto':
+        # 获取多数类和少数类的样本数
+        num_majority = labels[(labels == c_largest)].shape[0]
+        num_minority = labels[(labels == (c_largest - im_class_num))].shape[0]
+        # 计算需要生成的样本数以使少数类数量与多数类相同
+        target_num = num_majority - num_minority
+        portion = target_num / num_minority  # 计算重采样的比例
 
     for i in range(im_class_num):
         # 获取标签最多的类别的样本的索引
         new_chosen = idx_train[(labels == (c_largest - i))[idx_train]]
-        if portion == 0:  # refers to even distribution
-            # 控制重采样的比例为平均样本数量除以样本数量
-            c_portion = int(avg_number / new_chosen.shape[0])
-            portion_rest = (avg_number / new_chosen.shape[0]) - c_portion
-
+        if portion == 0 or portion == 'auto':  # refers to even distribution
+            # 如果portion是'auto'，则使用计算出的目标数
+            if portion == 'auto':
+                c_portion = target_num // new_chosen.shape[0]
+                portion_rest = target_num % new_chosen.shape[0] / new_chosen.shape[0]
+            else:
+                c_portion = int(avg_number / new_chosen.shape[0])
+                portion_rest = (avg_number / new_chosen.shape[0]) - c_portion
         else:
-            # 控制重采样的比例为给定的portion
             c_portion = int(portion)
             portion_rest = portion - c_portion
 
@@ -594,7 +765,6 @@ def src_smote(adj, adj_in, adj_out, features, labels, idx_train, portion=1.0, im
             np.fill_diagonal(distance, distance.max() + 100)  # 计算样本之间的距离矩阵
 
             idx_neighbor = distance.argmin(axis=-1)  # 根据距离矩阵找到每个样本的最近邻居索引
-
 
             interp_place = random.random()
             # 在样本和其最近邻居之间进行插值
@@ -739,6 +909,7 @@ def adj_mse_loss(adj_rec, adj_tgt, adj_mask=None):
 
 class EarlyStopping:
     """Early stops the training if validation loss doesn't improve after a given patience."""
+
     def __init__(self, save_path, patience=30, verbose=False, delta=0):
         """
         Args:
@@ -781,5 +952,5 @@ class EarlyStopping:
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
         path = os.path.join(self.save_path, 'best_network.pth')
-        torch.save(model.state_dict(), path)	# 这里会存储迄今最优模型的参数
+        torch.save(model.state_dict(), path)  # 这里会存储迄今最优模型的参数
         self.val_loss_min = val_loss
